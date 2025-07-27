@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "git-cache"
+version = "0.0.1"
+description = "Git repository caching utility"
+readme = "README.md"
+authors = [{ name = "Darianopolis", email = "darianopolis@gmail.com" }]
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+git-cache = "git_cache.main:cli"

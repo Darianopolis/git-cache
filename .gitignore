@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.env/
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# pip cache and dist artifacts
+*.egg-info/
+*.egg/
+*.eggs/
+dist/
+build/
+*.manifest
+pip-wheel-metadata/
+
+# VS Code settings
+.vscode/
+
+# PyInstaller
+*.spec
+
+# Test cache
+.cache/
+pytest_cache/
+
+# MyPy, coverage, etc
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# macOS, Linux, Windows system junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Editable install symlinks
+.git_cache_tool.egg-info/
