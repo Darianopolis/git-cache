@@ -34,7 +34,15 @@ def hash_str(str):
 
 def create_symlink(path: Path, target: Path, force: bool = False):
     if path.exists() or path.is_symlink():
-        if path.samefile(target):
+
+        same_file = False
+        try:
+            same_file = path.samefile(target)
+        except:
+            print(f"[link] Error following existing path, attempt to replace...")
+            pass
+
+        if same_file:
             return
         else:
             if path.is_symlink():
@@ -63,21 +71,16 @@ def get_metadata_repo(url: str) -> Path:
     if not metadata_repo.exists():
         print(f"[metadata] Cloning metadata repo for {url}")
         run_git(["clone", url, "--no-checkout", metadata_repo])
+        # TODO: Mirror is excessively expensive (11 minutes for an llvm-project checkout) and we don't seem to need
+        #       *everything* that a mirror provides
+        # run_git(["clone", url, "--mirror", metadata_repo])
 
     return metadata_repo
 
-def is_branch(metadata_repo: Path, ref: str) -> bool:
+def is_known_branch(metadata_repo: Path, ref: str) -> bool:
     try:
         branches = run_git(["branch", "-a"], cwd=metadata_repo, capture_output=True).splitlines()
         return any(line.strip()[len("remotes/origin/"):] == ref for line in branches)
-    except subprocess.CalledProcessError:
-        pass
-    return False
-
-def is_tag(metadata_repo: Path, ref: str) -> bool:
-    try:
-        tags = run_git(["tag", "-l"], cwd=metadata_repo, capture_output=True).splitlines()
-        return any(line.strip() == ref for line in tags)
     except subprocess.CalledProcessError:
         pass
     return False
@@ -107,19 +110,31 @@ def get_commit(metadata_repo: Path, ref: str) -> str:
     return commit
 
 def checkout(url: str, ref: str, fetch: bool) -> Path:
+
+    checkout_root_dir = cache_dir / "checkout"
+
+    maybe_checkout_repo = checkout_root_dir / hash_str(f"{url}@{ref}")
+    if maybe_checkout_repo.exists():
+        # ref was full hash and repo exists
+        return maybe_checkout_repo
+
     metadata_repo = get_metadata_repo(url)
-    if fetch and is_branch(metadata_repo, ref):
-        print(f"[checkout] Fetching branch content: {ref}")
+    if fetch and is_known_branch(metadata_repo, ref):
+        print(f"[checkout] Fetching updated branch content: {ref}")
         run_git(["fetch", "origin", ref], cwd=metadata_repo)
     commit = get_commit(metadata_repo, ref)
 
-    checkout_repo = cache_dir / "checkout" / hash_str(f"{url}@{commit}")
+    checkout_repo = checkout_root_dir / hash_str(f"{url}@{commit}")
+    if checkout_repo.exists():
+        return checkout_repo
 
-    if not checkout_repo.exists():
-        print(f"[checkout] Checking out {ref} - {commit}")
-        run_git(["clone", url, f"--revision={commit}", "--depth=1", f"--reference={metadata_repo}", checkout_repo])
+    print(f"[checkout] Checking out {ref} - {commit}")
+    run_git(["clone", metadata_repo, f"--revision={commit}", checkout_repo])
 
-    checkout_submodules(checkout_repo, commit)
+    # TODO: Only need this for tooling that cares about origin repo
+    # run_git(["remote", "set-url", "origin", url], cwd=checkout_repo)
+
+    checkout_submodules(metadata_repo, checkout_repo, commit)
 
     return checkout_repo
 
@@ -152,7 +167,7 @@ def resolve_relative_submodule_url(parent_url: str, relative: str) -> str:
     resolved_url = f"{parsed.scheme}://{parsed.netloc}{resolved_path}"
     return resolved_url
 
-def checkout_submodules(parent_repo: Path, commit: str):
+def checkout_submodules(parent_metadata_repo: Path, parent_repo: Path, commit: str):
     gitmodules_path = parent_repo / ".gitmodules"
     if not gitmodules_path.exists():
         return
@@ -173,6 +188,8 @@ def checkout_submodules(parent_repo: Path, commit: str):
         if parts[1] == "commit":
             path_to_sha[parts[3]] = parts[2]
 
+    parent_url = None
+
     for name, path, url in submodules:
         if path not in path_to_sha:
             raise RuntimeError(f"[submodule] No SHA found for submodule path {path}")
@@ -181,7 +198,9 @@ def checkout_submodules(parent_repo: Path, commit: str):
         if url.startswith("./") or url.startswith("../"):
             if url.startswith("../"):
                 url = url[1:]
-            parent_url = run_git(["remote", "get-url", "origin"], cwd=parent_repo, capture_output=True)
+            if not parent_url:
+                parent_url = run_git(["remote", "get-url", "origin"], cwd=parent_metadata_repo, capture_output=True)
+                print(f"[submodules] Fetching parent repo URL: {parent_url}")
             url = resolve_relative_submodule_url(parent_url, url)
 
         submodule_repo = checkout(url, sha, False)
@@ -193,6 +212,9 @@ def checkout_submodules(parent_repo: Path, commit: str):
 # TODO: Accept descriptive short name to prefix SHA-256 folders with for debugging?
 # TODO: Process for deleting stale checkouts
 # TODO: Copy-out and/or Copy-on-Write views?
+# TODO: The system is brittle to interruptions during checkout - it early-outs
+#         on subsequent runs at the mere presence of a checkout folder
+#         Add a flag that forces all checkouts to be re-checked completely?
 
 def run(url: str, ref: str, out_dir: Path, fetch: bool):
     checkout_dir = checkout(url, ref, fetch)
@@ -206,8 +228,8 @@ def cli():
     parser.add_argument("--url",     type=str,  required=True, help="Git repository URL")
     parser.add_argument("--ref",     type=str,  required=True, help="Commit hash, tag, or branch")
     parser.add_argument("--dir",     type=str,  required=True, help="Target directory")
-    parser.add_argument("--fetch",  type=bool, default=False, help="Fetch branch content")
-    parser.add_argument("--verbose", type=bool, default=False, help="Verbose output")
+    parser.add_argument("--fetch",   action="store_true",      help="Fetch branch content")
+    parser.add_argument("--verbose", action="store_true",      help="Verbose output")
     args = parser.parse_args()
 
     if args.verbose:
