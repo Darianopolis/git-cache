@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Git repository caching utility"
 readme = "README.md"
 authors = [{ name = "Darianopolis", email = "darianopolis@gmail.com" }]
-license = {text = "MIT"}
+license = "MIT"
 dependencies = []
 
 [project.scripts]

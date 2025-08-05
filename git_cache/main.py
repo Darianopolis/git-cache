@@ -7,6 +7,7 @@ import configparser
 import urllib.parse
 import re
 from pathlib import Path
+from collections import namedtuple
 
 _cache_dir = os.environ.get("GIT_CACHE_DIR")
 if not _cache_dir:
@@ -32,7 +33,7 @@ def run_git(args, cwd=None, check=True, capture_output=False) -> str:
 def hash_str(str):
     return hashlib.sha256(str.encode()).hexdigest()
 
-def create_symlink(path: Path, target: Path, force: bool = False):
+def create_symlink(path: Path, target: Path, force: bool = False, quiet = False):
     if path.exists() or path.is_symlink():
 
         same_file = False
@@ -46,20 +47,21 @@ def create_symlink(path: Path, target: Path, force: bool = False):
             return
         else:
             if path.is_symlink():
-                print(f"[link] Removing existing symlink from {path} -> {path.resolve()}")
+                # print(f"[link] Removing existing symlink from {path} -> {path.resolve()}")
                 path.unlink()
             else:
                 if force:
                     if path.is_file():
-                        print(f"[link] Removing existing file")
+                        # print(f"[link] Removing existing file")
                         path.unlink()
                     else:
-                        print(f"[link] Removing existing directory")
+                        # print(f"[link] Removing existing directory")
                         shutil.rmtree(path)
                 else:
                     raise RuntimeError(f"[link] Target path {path} already exists and is not a symlink.")
 
-    print(f"[link] Creating symlink from {path} -> {target}")
+    if not quiet:
+        print(f"[link] Creating symlink from {path} -> {target}")
     os.makedirs(path.parent, exist_ok=True)
     path.symlink_to(target.resolve())
 
@@ -85,7 +87,12 @@ def is_known_branch(metadata_repo: Path, ref: str) -> bool:
         pass
     return False
 
-def get_commit(metadata_repo: Path, ref: str) -> str:
+def get_commit(metadata_repo: Path, ref: str, fetch: bool) -> str:
+    def fetch_if_update_and_branch():
+        if fetch and is_known_branch(metadata_repo, ref):
+            print(f"[checkout] Fetching updated branch content: {ref}")
+            run_git(["fetch", "origin", ref], cwd=metadata_repo)
+
     try:
         if len(ref) == 40:
             # Probably a SHA-256 hash
@@ -94,9 +101,11 @@ def get_commit(metadata_repo: Path, ref: str) -> str:
                 commit = ref
             except:
                 # Slow path for potential 40 character long branch or tag
+                fetch_if_update_and_branch()
                 commit = run_git(["rev-parse", ref], cwd=metadata_repo, capture_output=True)
                 run_git(["cat-file", "-e", f"{commit}^{{commit}}"], cwd=metadata_repo)
         else:
+            fetch_if_update_and_branch()
             commit = run_git(["rev-parse", ref], cwd=metadata_repo, capture_output=True)
 
     except subprocess.CalledProcessError:
@@ -108,35 +117,6 @@ def get_commit(metadata_repo: Path, ref: str) -> str:
             raise RuntimeError(f"Ref '{ref}' could not be resolved or fetched directly.")
 
     return commit
-
-def checkout(url: str, ref: str, fetch: bool) -> Path:
-
-    checkout_root_dir = cache_dir / "checkout"
-
-    maybe_checkout_repo = checkout_root_dir / hash_str(f"{url}@{ref}")
-    if maybe_checkout_repo.exists():
-        # ref was full hash and repo exists
-        return maybe_checkout_repo
-
-    metadata_repo = get_metadata_repo(url)
-    if fetch and is_known_branch(metadata_repo, ref):
-        print(f"[checkout] Fetching updated branch content: {ref}")
-        run_git(["fetch", "origin", ref], cwd=metadata_repo)
-    commit = get_commit(metadata_repo, ref)
-
-    checkout_repo = checkout_root_dir / hash_str(f"{url}@{commit}")
-    if checkout_repo.exists():
-        return checkout_repo
-
-    print(f"[checkout] Checking out {ref} - {commit}")
-    run_git(["clone", metadata_repo, f"--revision={commit}", checkout_repo])
-
-    # TODO: Only need this for tooling that cares about origin repo
-    # run_git(["remote", "set-url", "origin", url], cwd=checkout_repo)
-
-    checkout_submodules(metadata_repo, checkout_repo, commit)
-
-    return checkout_repo
 
 # ------------------------------------------------------------------------------
 
@@ -167,10 +147,12 @@ def resolve_relative_submodule_url(parent_url: str, relative: str) -> str:
     resolved_url = f"{parsed.scheme}://{parsed.netloc}{resolved_path}"
     return resolved_url
 
-def checkout_submodules(parent_metadata_repo: Path, parent_repo: Path, commit: str):
+Submodule = namedtuple('Submodule', ['name', 'path', 'url', 'hash'])
+
+def get_submodules(parent_metadata_repo: Path, parent_repo: Path, commit: str) -> list[Submodule]:
     gitmodules_path = parent_repo / ".gitmodules"
     if not gitmodules_path.exists():
-        return
+        return []
 
     gitmodules = load_gitmodules(gitmodules_path)
     submodules = []
@@ -190,6 +172,8 @@ def checkout_submodules(parent_metadata_repo: Path, parent_repo: Path, commit: s
 
     parent_url = None
 
+    output: list[Submodule] = []
+
     for name, path, url in submodules:
         if path not in path_to_sha:
             raise RuntimeError(f"[submodule] No SHA found for submodule path {path}")
@@ -203,26 +187,113 @@ def checkout_submodules(parent_metadata_repo: Path, parent_repo: Path, commit: s
                 print(f"[submodules] Fetching parent repo URL: {parent_url}")
             url = resolve_relative_submodule_url(parent_url, url)
 
-        submodule_repo = checkout(url, sha, False)
-        create_symlink(parent_repo / path, submodule_repo, force=True)
+        output.append(Submodule(name, path, url, sha))
+
+    return output
+
+# ------------------------------------------------------------------------------
+
+checkout_root_dir = cache_dir / "checkout"
+
+def checkout(url: str, ref: str, fetch: bool) -> Path:
+
+    maybe_checkout_repo = checkout_root_dir / hash_str(f"{url}@{ref}")
+    if maybe_checkout_repo.exists():
+        # ref was full hash and repo exists
+        return maybe_checkout_repo
+
+    metadata_repo = get_metadata_repo(url)
+    commit = get_commit(metadata_repo, ref, fetch)
+
+    checkout_repo = checkout_root_dir / hash_str(f"{url}@{commit}")
+    if checkout_repo.exists():
+        return checkout_repo
+
+    print(f"[checkout] Checking out {ref} - {commit}")
+    run_git(["clone", metadata_repo, f"--revision={commit}", checkout_repo])
+
+    # TODO: Only need this for tooling that cares about origin repo
+    # run_git(["remote", "set-url", "origin", url], cwd=checkout_repo)
+
+    for sm in get_submodules(metadata_repo, checkout_repo, commit):
+        submodule_repo = checkout(sm.url, sm.hash, fetch=False)
+        create_symlink(checkout_repo / sm.path, submodule_repo, force=True)
+
+    return checkout_repo
+
+# ------------------------------------------------------------------------------
+
+def make_view(src_root: Path, dst_root: Path):
+    print(f"[view] {os.path.abspath(dst_root)}")
+
+    src_root = src_root.resolve()
+    dst_root = dst_root.resolve()
+    os.makedirs(dst_root, exist_ok=True)
+
+    create_symlink(dst_root / ".git", src_root / ".git", quiet=True)
+
+    def is_checkout(p: Path) -> bool:
+        return p.parent == checkout_root_dir
+
+    def replicate(src: Path, dst: Path):
+        if src.is_symlink():
+            target = os.readlink(src)
+            if os.path.isabs(target):
+                real_target = Path(target)
+                if real_target.is_dir() and is_checkout(real_target):
+                    print(f"[view] {dst}")
+                    # Explode the symlinked directory
+                    dst.mkdir(exist_ok=True)
+                    for child in real_target.iterdir():
+                        replicate(child, dst / child.name)
+                else:
+                    # Copy the symlink as-is
+                    create_symlink(dst, target, quiet=True)
+            else:
+                # Relative symlink - preserve
+                create_symlink(dst, target, quiet=True)
+
+        elif src.is_dir():
+            dst.mkdir(exist_ok=True)
+            for child in src.iterdir():
+                replicate(child, dst / child.name)
+
+        elif src.is_file():
+            create_symlink(dst, src, quiet=True)
+
+    for item in src_root.iterdir():
+        if item.name == ".git":
+            continue
+
+        replicate(item, dst_root / item.name)
+
+# ------------------------------------------------------------------------------
+
+def list_urls():
+    for metadata_repo in (cache_dir / "metadata").iterdir():
+        url = run_git(["remote", "get-url", "origin"], cwd=metadata_repo, capture_output=True)
+        print(url)
 
 # ------------------------------------------------------------------------------
 
 # TODO: metadata deduplication (for URL formatting variations)
 # TODO: Accept descriptive short name to prefix SHA-256 folders with for debugging?
 # TODO: Process for deleting stale checkouts
-# TODO: Copy-out and/or Copy-on-Write views?
 # TODO: The system is brittle to interruptions during checkout - it early-outs
 #         on subsequent runs at the mere presence of a checkout folder
 #         Add a flag that forces all checkouts to be re-checked completely?
+# TODO: Use OverlayFS for copy-on-write views on Linux? (mount -t overlay overlay -o lowerdir=lower,upperdir=upper,workdir=work merged)
 
 def run(url: str, ref: str, out_dir: Path, fetch: bool):
     checkout_dir = checkout(url, ref, fetch)
     create_symlink(out_dir, checkout_dir)
+    # make_view(checkout_dir, out_dir)
 
 def cli():
     global verbose
     import argparse
+
+    # list_urls()
 
     parser = argparse.ArgumentParser(description="Upstream git caching layer")
     parser.add_argument("--url",     type=str,  required=True, help="Git repository URL")
